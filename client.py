@@ -1,315 +1,221 @@
-import platform
-import subprocess
-import hashlib
-import requests
 import sys
 import os
 import webbrowser
+import threading
+import time
+from datetime import datetime
 
-# =====================================================================
-# CONFIGURAÇÕES DE ENDPOINTS E ROTAS DO SISTEMA
-# =====================================================================
-# URL base do painel web hospedado no Render
-WEB_BASE_URL = "https://elisiounlockmaster.onrender.com"
-# Endpoint dedicado para validação via token seguro gerado pelo painel
-SERVER_TOKEN_URL = f"{WEB_BASE_URL}/api/validar_token"
+import customtkinter as ctk
+from tkinter import messagebox
 
-def limpar_tela():
-    """Limpa a tela conforme o sistema operacional de forma compatível"""
-    if platform.system() == "Windows":
-        os.system('cls')
-    else:
-        os.system('clear')
+from modules.auth import validar_token_servidor
+from modules.adb_tools import executar_adb
+from modules.fastboot_tools import executar_fastboot
+from modules.config import carregar_configuracao
+from modules.logger import registrar_log, registrar_log as log_sistema
 
-def obter_caminho_binario(nome_binario):
-    """Garante que o app encontre os binários dentro da pasta bin/ mesmo após empacotado pelo PyInstaller"""
-    if getattr(sys, 'frozen', False):
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.abspath(os.path.dirname(__file__))
-    return os.path.join(base_path, 'bin', nome_binario)
+config = carregar_configuracao()
 
-def get_hwid():
-    """Gera o HWID único da máquina para bloqueio rígido contra pirataria"""
-    try:
-        sistema = platform.system()
-        if sistema == "Windows":
-            cmd = "wmic csproduct get uuid"
-            uuid = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode().split('\n')[1].strip()
-        elif sistema == "Darwin":  # macOS
-            cmd = "ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID"
-            uuid = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode().split('"')[3].strip()
+class ElisioUnlockMasterApp(ctk.CTk):
+    def __init__(self, dados_sessao):
+        super().__init__()
+        
+        self.dados_sessao = dados_sessao
+        self.title(f"Elísio Unlock Master — {config.get('versao_atual', 'v2.5.0')}")
+        self.geometry("1100x680")
+        self.minsize(980, 600)
+        
+        ctk.set_appearance_mode("Dark")
+        ctk.set_default_color_theme("blue")
+        
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+        
+        self.criar_barra_lateral()
+        self.criar_painel_principal()
+        
+        # Thread de monitoramento USB segura com after()
+        self.ativo = True
+        self.thread_monitor = threading.Thread(target=self.loop_monitoramento_usb, daemon=True)
+        self.thread_monitor.start()
+
+    def criar_barra_lateral(self):
+        self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_rowconfigure(7, weight=1)
+        
+        ctk.CTkLabel(self.sidebar, text="⚡ ELÍSIO MASTER", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, padx=20, pady=(20, 10))
+        
+        usuario = self.dados_sessao.get("usuario", "Técnico")
+        validade = self.dados_sessao.get("validade", "Ativa")
+        
+        info_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        info_frame.grid(row=1, column=0, padx=15, pady=5, sticky="ew")
+        
+        ctk.CTkLabel(info_frame, text=f"👤 {usuario}", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(info_frame, text=f"🛡️ Licença: {validade}", font=ctk.CTkFont(size=11), text_color="#2ecc71").pack(anchor="w")
+        ctk.CTkLabel(info_frame, text="🟢 Servidor: Online", font=ctk.CTkFont(size=11), text_color="#3498db").pack(anchor="w")
+        
+        ctk.CTkFrame(self.sidebar, height=2, fg_color="#34495e").grid(row=2, column=0, padx=20, pady=15, sticky="ew")
+        
+        ctk.CTkButton(self.sidebar, text="🌐 Universal & FRP", command=lambda: self.mudar_aba("universal")).grid(row=3, column=0, padx=20, pady=8, sticky="ew")
+        ctk.CTkButton(self.sidebar, text="📱 Marcas & Modelos", command=lambda: self.mudar_aba("marcas")).grid(row=4, column=0, padx=20, pady=8, sticky="ew")
+        ctk.CTkButton(self.sidebar, text="⚡ Flashing & Fastboot", command=lambda: self.mudar_aba("flash")).grid(row=5, column=0, padx=20, pady=8, sticky="ew")
+        ctk.CTkButton(self.sidebar, text="⚙️ Informações & Diagnóstico", command=lambda: self.mudar_aba("info")).grid(row=6, column=0, padx=20, pady=8, sticky="ew")
+        
+        ctk.CTkButton(self.sidebar, text="Sair / Encerrar", fg_color="#c0392b", hover_color="#e74c3c", command=self.fechar_sistema).grid(row=8, column=0, padx=20, pady=20, sticky="ew")
+
+    def criar_painel_principal(self):
+        self.main_panel = ctk.CTkFrame(self, corner_radius=0, fg_color="#1a1a1a")
+        self.main_panel.grid(row=0, column=1, sticky="nsew")
+        self.main_panel.grid_rowconfigure(1, weight=1)
+        self.main_panel.grid_columnconfigure(0, weight=1)
+        
+        self.header_frame = ctk.CTkFrame(self.main_panel, height=60, fg_color="#262626")
+        self.header_frame.grid(row=0, column=0, sticky="ew", padx=15, pady=15)
+        
+        self.lbl_status_device = ctk.CTkLabel(self.header_frame, text="🔌 Detetando estado do dispositivo na USB...", font=ctk.CTkFont(size=13, weight="bold"), text_color="#f1c40f")
+        self.lbl_status_device.pack(side="left", padx=20, pady=15)
+        
+        self.content_frame = ctk.CTkFrame(self.main_panel, fg_color="transparent")
+        self.content_frame.grid(row=1, column=0, sticky="nsew", padx=15, pady=(0, 15))
+        self.content_frame.grid_rowconfigure(0, weight=1)
+        self.content_frame.grid_columnconfigure(0, weight=1)
+        
+        self.mudar_aba("universal")
+
+    def limpar_conteudo(self):
+        for widget in self.content_frame.winfo_children():
+            widget.destroy()
+
+    def mudar_aba(self, nome):
+        self.limpar_conteudo()
+        if nome == "universal":
+            self.aba_universal()
+        elif nome == "marcas":
+            self.aba_marcas()
+        elif nome == "flash":
+            self.aba_flash()
+        elif nome == "info":
+            self.aba_info()
+
+    def aba_universal(self):
+        frame = ctk.CTkFrame(self.content_frame, fg_color="#222222")
+        frame.grid(row=0, column=0, sticky="nsew")
+        ctk.CTkLabel(frame, text="Ferramentas Universais de Manutenção", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=20, pady=15)
+        
+        btn_f = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_f.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkButton(btn_f, text="Listar Portas ADB", width=180, command=lambda: self.escrever_log(executar_adb("devices"))).pack(side="left", padx=5)
+        ctk.CTkButton(btn_f, text="Bypass FRP (Pacotes)", width=180, command=self.acao_bypass_frp).pack(side="left", padx=5)
+        ctk.CTkButton(btn_f, text="Recovery Mode", width=180, command=lambda: self.escrever_log(executar_adb("reboot recovery"))).pack(side="left", padx=5)
+        
+        self.criar_caixa_log(frame)
+
+    def aba_marcas(self):
+        frame = ctk.CTkFrame(self.content_frame, fg_color="#222222")
+        frame.grid(row=0, column=0, sticky="nsew")
+        ctk.CTkLabel(frame, text="Módulo por Fabricante", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=20, pady=15)
+        
+        sel_f = ctk.CTkFrame(frame, fg_color="transparent")
+        sel_f.pack(fill="x", padx=20, pady=10)
+        
+        self.combo_marca = ctk.CTkComboBox(sel_f, values=["Samsung", "Xiaomi", "Motorola", "Tecno / Infinix"], width=220)
+        self.combo_marca.pack(side="left", padx=5)
+        ctk.CTkButton(sel_f, text="Executar Rotina MTP/Fastboot", command=self.executar_rotina_marca).pack(side="left", padx=10)
+        
+        self.criar_caixa_log(frame)
+
+    def aba_flash(self):
+        frame = ctk.CTkFrame(self.content_frame, fg_color="#222222")
+        frame.grid(row=0, column=0, sticky="nsew")
+        ctk.CTkLabel(frame, text="Flashing & Fastboot Partition Tools", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=20, pady=15)
+        
+        btn_f = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_f.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkButton(btn_f, text="Listar Fastboot Devices", command=lambda: self.escrever_log(executar_fastboot("devices"))).pack(side="left", padx=5)
+        ctk.CTkButton(btn_f, text="Wipe Userdata (Fastboot)", fg_color="#c0392b", hover_color="#e74c3c", command=lambda: self.escrever_log(executar_fastboot("erase userdata"))).pack(side="left", padx=5)
+        
+        self.criar_caixa_log(frame)
+
+    def aba_info(self):
+        frame = ctk.CTkFrame(self.content_frame, fg_color="#222222")
+        frame.grid(row=0, column=0, sticky="nsew")
+        ctk.CTkLabel(frame, text="Diagnóstico Completo de Hardware", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=20, pady=15)
+        
+        ctk.CTkButton(frame, text="Ler Propriedades do Aparelho", command=self.ler_hardware).pack(anchor="w", padx=20, pady=10)
+        self.criar_caixa_log(frame)
+
+    def criar_caixa_log(self, parent):
+        log_container = ctk.CTkFrame(parent, fg_color="transparent")
+        log_container.pack(fill="both", expand=True, padx=20, pady=10)
+        
+        self.txt_log = ctk.CTkTextbox(log_container, fg_color="#121212", text_color="#2ecc71", font=ctk.CTkFont(family="Consolas", size=12))
+        self.txt_log.pack(fill="both", expand=True)
+        self.escrever_log(f"[{datetime.now().strftime('%H:%M:%S')}] Módulo gráfico iniciado com sucesso.")
+
+    def escrever_log(self, texto):
+        if hasattr(self, 'txt_log'):
+            self.txt_log.insert("end", texto + "\n")
+            self.txt_log.see("end")
+
+    def acao_bypass_frp(self):
+        self.escrever_log("[+] Iniciando contorno de FRP...")
+        self.escrever_log(executar_adb("shell am start -a android.intent.action.VIEW -d https://www.google.com"))
+
+    def ler_hardware(self):
+        self.escrever_log("--- DIAGNÓSTICO DE HARDWARE ---")
+        self.escrever_log("Modelo: " + executar_adb("shell getprop ro.product.model"))
+        self.escrever_log("Android: " + executar_adb("shell getprop ro.build.version.release"))
+        self.escrever_log("Serial: " + executar_adb("get-serialno"))
+
+    def executar_rotina_marca(self):
+        marca = self.combo_marca.get()
+        self.escrever_log(f"[+] Aplicando rotina para {marca}...")
+        if "Samsung" in marca:
+            self.escrever_log(executar_adb("shell am start -a android.intent.action.DIAL -d tel:%2A%230%2A%23"))
         else:
-            uuid = platform.node() + platform.machine()
-        
-        return hashlib.sha256(uuid.encode()).hexdigest()
-    except:
-        return hashlib.sha256((platform.node() + platform.system()).encode()).hexdigest()
+            self.escrever_log(executar_adb("devices"))
 
-def executar_adb(args):
-    """Executa o utilitário ADB embutido com tratamento de exceções"""
-    adb_path = obter_caminho_binario("adb.exe" if platform.system() == "Windows" else "adb")
-    cmd = f'"{adb_path}" {args}'
-    try:
-        res = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=10)
-        return res.decode('utf-8', errors='ignore')
-    except Exception as e:
-        return f"Erro de Execução ADB: {str(e)}"
+    def loop_monitoramento_usb(self):
+        while self.ativo:
+            try:
+                res = executar_adb("get-state")
+                if "device" in res:
+                    modelo = executar_adb("shell getprop ro.product.model")
+                    texto = f"🟢 Conectado ADB: {modelo}" if modelo else "🟢 Dispositivo ADB Conectado"
+                    self.after(0, lambda: self.lbl_status_device.configure(text=texto, text_color="#2ecc71"))
+                else:
+                    res_fb = executar_fastboot("devices")
+                    if len(res_fb.strip()) > 0:
+                        self.after(0, lambda: self.lbl_status_device.configure(text="⚡ Dispositivo em Fastboot", text_color="#f1c40f"))
+                    else:
+                        self.after(0, lambda: self.lbl_status_device.configure(text="🔌 Nenhum dispositivo detetado na porta USB", text_color="#e74c3c"))
+            except Exception:
+                pass
+            time.sleep(3)
 
-def executar_fastboot(args):
-    """Executa o utilitário Fastboot embutido com tratamento de exceções"""
-    fb_path = obter_caminho_binario("fastboot.exe" if platform.system() == "Windows" else "fastboot")
-    cmd = f'"{fb_path}" {args}'
-    try:
-        res = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=10)
-        return res.decode('utf-8', errors='ignore')
-    except Exception as e:
-        return f"Erro de Execução Fastboot: {str(e)}"
-
-# =====================================================================
-# ROTINAS DE HARD RESET, FRP E MÓDULOS DE MANUTENÇÃO
-# =====================================================================
-
-def exibir_guia_botoes():
-    limpar_tela()
-    print("==================================================")
-    print("        GUIA TÉCNICO DE RECOVERY MANUAL           ")
-    print("==================================================")
-    print("Utilize os botões físicos caso o modo automático falhe:")
-    print("\n[ SAMSUNG ]")
-    print("• Desligue completamente o aparelho.")
-    print("• Pressione Volume Mais (+) + Power até o logotipo aparecer.")
-    print("• Navegue até 'Wipe data/factory reset' e confirme.")
-    
-    print("\n[ XIAOMI / REDMI ]")
-    print("• Desligue o aparelho e pressione Volume Mais (+) + Power.")
-    print("• Selecione 'Wipe Data' -> 'Wipe All Data'.")
-    
-    print("\n[ MOTOROLA ]")
-    print("• Com o aparelho desligado, segure Volume Menos (-) + Power.")
-    print("• Selecione 'Recovery Mode' utilizando as teclas de volume.")
-    print("==================================================")
-    input("\nPressione [Enter] para retornar ao menu...")
-
-def menu_universal():
-    while True:
-        limpar_tela()
-        print("==================================================")
-        print("          CENTRAL DE SUPORTE UNIVERSAL            ")
-        print("==================================================")
-        print("[1] Listar Dispositivos ADB Conectados")
-        print("[2] Executar Bypass de FRP (Via Pacotes ADB)")
-        print("[3] Forçar Entrada em Recovery Mode")
-        print("[4] Listar Dispositivos em Fastboot Mode")
-        print("[5] Executar Limpeza de Userdata (Fastboot Wipe)")
-        print("[6] Visualizar Guia de Botões Físicos")
-        print("[0] Retornar ao Painel Principal")
-        print("==================================================")
-        
-        op = input("Selecione uma opção operacional: ").strip()
-        if op == "1":
-            print("\n[+] Sondando portas ADB ativas...")
-            print(executar_adb("devices"))
-            input("\nPressione [Enter] para continuar...")
-        elif op == "2":
-            print("\n[+] Acionando pacotes de sistema para contorno de FRP...")
-            print(executar_adb("shell am start -S -n com.google.android.gsf/.update.SystemUpdateActivity"))
-            print(executar_adb("shell am start -a android.intent.action.VIEW -d https://www.google.com"))
-            print("[SUCESSO] Comandos disparados para a interface do dispositivo.")
-            input("\nPressione [Enter] para continuar...")
-        elif op == "3":
-            print("\n[+] Enviando comando para reboot em recovery...")
-            print(executar_adb("reboot recovery"))
-            print("[SUCESSO] Dispositivo redirecionado com êxito.")
-            input("\nPressione [Enter] para continuar...")
-        elif op == "4":
-            print("\n[+] Sondando portas Fastboot ativas...")
-            print(executar_fastboot("devices"))
-            input("\nPressione [Enter] para continuar...")
-        elif op == "5":
-            print("\n[+] Executando limpeza de particionamento userdata...")
-            print(executar_fastboot("erase userdata"))
-            print(executar_fastboot("erase cache"))
-            print(executar_fastboot("reboot"))
-            print("[SUCESSO] Limpeza concluída e comando de reinicialização enviado.")
-            input("\nPressione [Enter] para continuar...")
-        elif op == "6":
-            exibir_guia_botoes()
-        elif op == "0":
-            break
-
-def menu_marcas():
-    while True:
-        limpar_tela()
-        print("==================================================")
-        print("          DIAGNÓSTICO E ROTINAS POR MARCA         ")
-        print("==================================================")
-        print("[1] Samsung (FRP MTP & Recovery)")
-        print("[2] Xiaomi / Redmi (Bootloader & Erase Userdata)")
-        print("[3] Motorola (Get Unlock Data & Fastboot)")
-        print("[4] Tecno / Infinix / Itel (Comandos MTK/Preloader)")
-        print("[0] Retornar ao Painel Principal")
-        print("==================================================")
-        
-        marca_op = input("Selecione a fabricante alvo: ").strip()
-        if marca_op == "0":
-            break
-        elif marca_op == "1":
-            limpar_tela()
-            print("--- PROCEDIMENTOS SAMSUNG ---")
-            print("[1] Forçar Modo Recovery")
-            print("[2] Disparar Navegador Web (FRP)")
-            sub = input("Escolha o procedimento: ").strip()
-            if sub == "1":
-                print(executar_adb("reboot recovery"))
-            elif sub == "2":
-                print(executar_adb("shell am start -a android.intent.action.VIEW -d https://www.google.com"))
-            input("\nPressione [Enter] para continuar...")
-        elif marca_op == "2":
-            limpar_tela()
-            print("--- PROCEDIMENTOS XIAOMI / REDMI ---")
-            print("[1] Verificar Status Fastboot")
-            print("[2] Solicitar Desbloqueio Bootloader")
-            print("[3] Executar Wipe Userdata")
-            sub = input("Escolha o procedimento: ").strip()
-            if sub == "1":
-                print(executar_fastboot("devices"))
-            elif sub == "2":
-                print(executar_fastboot("oem unlock"))
-                print(executar_fastboot("flashing unlock"))
-            elif sub == "3":
-                print(executar_fastboot("erase userdata"))
-                print(executar_fastboot("reboot"))
-            input("\nPressione [Enter] para continuar...")
-        elif marca_op == "3":
-            limpar_tela()
-            print("--- PROCEDIMENTOS MOTOROLA ---")
-            print("[1] Obter Token de Desbloqueio (Get Unlock Data)")
-            print("[2] Reiniciar Dispositivo")
-            sub = input("Escolha o procedimento: ").strip()
-            if sub == "1":
-                print(executar_fastboot("oem get_unlock_data"))
-            elif sub == "2":
-                print(executar_fastboot("reboot"))
-            input("\nPressione [Enter] para continuar...")
-        elif marca_op == "4":
-            limpar_tela()
-            print("--- PROCEDIMENTOS MEDIAREK / GENÉRICOS ---")
-            print("[1] Sondar Conexão ADB")
-            print("[2] Forçar Bootloader Mode")
-            sub = input("Escolha o procedimento: ").strip()
-            if sub == "1":
-                print(executar_adb("devices"))
-            elif sub == "2":
-                print(executar_adb("reboot bootloader"))
-            input("\nPressione [Enter] para continuar...")
-        else:
-            print("\n[!] Opção selecionada é inválida.")
-            input("Pressione [Enter] para tentar novamente...")
-
-def menu_ferramentas():
-    while True:
-        limpar_tela()
-        print("==================================================")
-        print("    ELÍSIO UNLOCK MASTER — PAINEL DE TÉCNICO       ")
-        print("==================================================")
-        print("[1] 🌐 Módulo Universal & Ferramentas de Reset")
-        print("[2] 📱 Central de Rotinas Avançadas por Marca")
-        print("[3] ⚡ Módulo de Flashing & Pacotes Stock")
-        print("[4] 📶 Módulo de Redes, Portas AT & ICCID")
-        print("[5] ⚙️ Informações e Leitura de Propriedades (Getprop)")
-        print("[0] Encerrar Sessão de Trabalho")
-        print("==================================================")
-        
-        opcao = input("Selecione o módulo de trabalho: ").strip()
-        
-        if opcao == "1":
-            menu_universal()
-        elif opcao == "2":
-            menu_marcas()
-        elif opcao == "3":
-            limpar_tela()
-            print("==================================================")
-            print("        MÓDULO DE FLASHING & PACOTES STOCK        ")
-            print("==================================================")
-            print("[+] Subsistema pronto para empacotamento e MediaTek Auth.")
-            input("\nPressione [Enter] para retornar...")
-        elif opcao == "4":
-            limpar_tela()
-            print("==================================================")
-            print("          MÓDULO DE REDES E COMANDOS AT           ")
-            print("==================================================")
-            print("[+] Subsistema de leitura de banda e desbloqueio ativo.")
-            input("\nPressione [Enter] para retornar...")
-        elif opcao == "5":
-            limpar_tela()
-            print("==================================================")
-            print("           DIAGNÓSTICO DE HARDWARE                ")
-            print("==================================================")
-            print("Modelo:", executar_adb("shell getprop ro.product.model").strip())
-            print("Versão Android:", executar_adb("shell getprop ro.build.version.release").strip())
-            print("Número de Série:", executar_adb("get-serialno").strip())
-            print("==================================================")
-            input("\nPressione [Enter] para retornar...")
-        elif opcao == "0":
-            print("\nEncerrando sessão com segurança. Até logo!")
-            sys.exit(0)
-        else:
-            print("\n[!] Opção inválida!")
-            input("Pressione [Enter] para continuar...")
-
-# =====================================================================
-# FLUXO DE SEGURANÇA E AUTENTICAÇÃO POR TOKEN DE PROTOCOLO
-# =====================================================================
+    def fechar_sistema(self):
+        self.ativo = False
+        self.destroy()
+        sys.exit(0)
 
 def main():
-    limpar_tela()
-    hwid = get_hwid()
-
-    # Validação obrigatória: O programa só prossegue se receber o token seguro via argumento de protocolo
     if len(sys.argv) > 1:
         token = sys.argv[1].strip()
-        print("==================================================")
-        print("    VALIDANDO AUTENTICAÇÃO VIA PAINEL WEB...      ")
-        print("==================================================")
-        
-        try:
-            response = requests.post(SERVER_TOKEN_URL, json={
-                "token": token,
-                "hwid": hwid
-            }, timeout=12)
-            
-            data = response.json()
-            
-            if data.get("status") == "sucesso":
-                print(f"\n[AUTORIZADO] {data.get('mensagem')}")
-                input("\nPressione [Enter] para carregar o painel operacional...")
-                menu_ferramentas()
-            else:
-                print(f"\n[ACESSO NEGADO] {data.get('mensagem')}")
-                print("[!] O programa será encerrado por motivos de segurança.")
-                input("\nPressione [Enter] para sair...")
-                sys.exit(1)
-        except Exception as e:
-            print(f"\n[ERRO DE CONEXÃO] Falha ao comunicar com o servidor central: {e}")
-            input("\nPressione [Enter] para sair...")
+        valido, dados = validar_token_servidor(token)
+        if valido:
+            app = ElisioUnlockMasterApp(dados)
+            app.mainloop()
+        else:
             sys.exit(1)
     else:
-        # Se executado diretamente sem token via argumento, redireciona estritamente para o site e fecha o terminal
-        print("==================================================")
-        print("    ELÍSIO UNLOCK MASTER — SEGURANÇA DE SESSÃO    ")
-        print("==================================================")
-        print("[!] Acesso direto bloqueado.")
-        print("[!] Redirecionando para a plataforma web oficial de login...")
-        print("[!] O aplicativo será encerrado imediatamente.")
-        print("==================================================")
-        
         try:
-            webbrowser.open(WEB_BASE_URL)
+            webbrowser.open(config.get("web_base_url"))
         except Exception:
             pass
-        
-        input("\nPressione [Enter] para fechar o programa...")
         sys.exit(0)
 
 if __name__ == "__main__":
