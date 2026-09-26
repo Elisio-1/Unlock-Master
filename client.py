@@ -8,20 +8,18 @@ from datetime import datetime
 import customtkinter as ctk
 from tkinter import messagebox
 
-from modules.auth import validar_token_servidor
+from modules.auth import validar_token_servidor, verificar_sessao_local
 from modules.adb_tools import executar_adb
 from modules.fastboot_tools import executar_fastboot
-from modules.config import carregar_configuracao
-from modules.logger import registrar_log, registrar_log as log_sistema
-
-config = carregar_configuracao()
+from modules.config import WEB_BASE_URL, VERSAO_ATUAL
+from modules.logger import registrar_log
 
 class ElisioUnlockMasterApp(ctk.CTk):
     def __init__(self, dados_sessao):
         super().__init__()
         
         self.dados_sessao = dados_sessao
-        self.title(f"Elísio Unlock Master — {config.get('versao_atual', 'v2.5.0')}")
+        self.title(f"Elísio Unlock Master — {VERSAO_ATUAL}")
         self.geometry("1100x680")
         self.minsize(980, 600)
         
@@ -34,7 +32,6 @@ class ElisioUnlockMasterApp(ctk.CTk):
         self.criar_barra_lateral()
         self.criar_painel_principal()
         
-        # Thread de monitoramento USB segura com after()
         self.ativo = True
         self.thread_monitor = threading.Thread(target=self.loop_monitoramento_usb, daemon=True)
         self.thread_monitor.start()
@@ -54,7 +51,7 @@ class ElisioUnlockMasterApp(ctk.CTk):
         
         ctk.CTkLabel(info_frame, text=f"👤 {usuario}", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w")
         ctk.CTkLabel(info_frame, text=f"🛡️ Licença: {validade}", font=ctk.CTkFont(size=11), text_color="#2ecc71").pack(anchor="w")
-        ctk.CTkLabel(info_frame, text="🟢 Servidor: Online", font=ctk.CTkFont(size=11), text_color="#3498db").pack(anchor="w")
+        ctk.CTkLabel(info_frame, text="🟢 Modo: PC (Offline 7d)", font=ctk.CTkFont(size=11), text_color="#3498db").pack(anchor="w")
         
         ctk.CTkFrame(self.sidebar, height=2, fg_color="#34495e").grid(row=2, column=0, padx=20, pady=15, sticky="ew")
         
@@ -202,21 +199,81 @@ class ElisioUnlockMasterApp(ctk.CTk):
         self.destroy()
         sys.exit(0)
 
-def main():
-    if len(sys.argv) > 1:
-        token = sys.argv[1].strip()
-        valido, dados = validar_token_servidor(token)
-        if valido:
-            app = ElisioUnlockMasterApp(dados)
-            app.mainloop()
-        else:
-            sys.exit(1)
-    else:
+
+class JanelaAutenticacao(ctk.CTk):
+    """Janela inicial pedida apenas quando não há sessão válida ou passaram 7 dias"""
+    def __init__(self):
+        super().__init__()
+        
+        self.title(f"Elísio Unlock Master — Autenticação ({VERSAO_ATUAL})")
+        self.geometry("480x360")
+        self.resizable(False, False)
+        
+        ctk.set_appearance_mode("Dark")
+        ctk.set_default_color_theme("blue")
+        
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.winfo_screenheight() // 2) - (h // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        
+        ctk.CTkLabel(self, text="⚡ ELÍSIO UNLOCK MASTER", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(25, 5))
+        ctk.CTkLabel(self, text="Insira o seu token (válido por 7 dias offline)", font=ctk.CTkFont(size=12), text_color="#aaaaaa").pack(pady=(0, 20))
+        
+        self.entry_token = ctk.CTkEntry(self, placeholder_text="Cole o seu token de acesso aqui...", width=380, height=40)
+        self.entry_token.pack(pady=10)
+        
+        self.btn_entrar = ctk.CTkButton(self, text="Abrir Ferramenta de Trabalho", width=380, height=40, command=self.tentar_entrar, font=ctk.CTkFont(weight="bold"))
+        self.btn_entrar.pack(pady=10)
+        
+        self.btn_web = ctk.CTkButton(self, text="Obter Token / Validar no Navegador", width=380, height=35, fg_color="#2c3e50", hover_color="#34495e", command=self.abrir_site_auth)
+        self.btn_web.pack(pady=5)
+        
+        self.lbl_erro = ctk.CTkLabel(self, text="", text_color="#e74c3c", font=ctk.CTkFont(size=11))
+        self.lbl_erro.pack(pady=5)
+
+    def abrir_site_auth(self):
         try:
-            webbrowser.open(config.get("web_base_url"))
+            webbrowser.open(WEB_BASE_URL)
         except Exception:
             pass
-        sys.exit(0)
+
+    def tentar_entrar(self):
+        token = self.entry_token.get().strip()
+        if not token:
+            self.lbl_erro.configure(text="Por favor, insira um token válido.")
+            return
+            
+        self.btn_entrar.configure(state="disabled", text="A validar com o servidor...")
+        self.lbl_erro.configure(text="")
+        
+        def processo():
+            valido, dados = validar_token_servidor(token)
+            if valido:
+                self.destroy()
+                app = ElisioUnlockMasterApp(dados)
+                app.mainloop()
+            else:
+                registrar_log(f"Falha de login: {dados}", "AVISO")
+                self.after(0, lambda: self.lbl_erro.configure(text=str(dados)))
+                self.after(0, lambda: self.btn_entrar.configure(state="normal", text="Abrir Ferramenta de Trabalho"))
+
+        threading.Thread(target=processo, daemon=True).start()
+
+
+def main():
+    # 1. Tenta abrir direto usando a licença offline de 7 dias guardada no PC
+    sessao_valida, dados_sessao = verificar_sessao_local()
+    if sessao_valida:
+        app = ElisioUnlockMasterApp(dados_sessao)
+        app.mainloop()
+        return
+
+    # 2. Se não houver sessão válida ou já passaram 7 dias, abre a janela de autenticação
+    app_auth = JanelaAutenticacao()
+    app_auth.mainloop()
 
 if __name__ == "__main__":
     main()
